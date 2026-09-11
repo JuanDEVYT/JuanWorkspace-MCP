@@ -1,20 +1,23 @@
 """
-Servidor MCP para el ecosistema JuanWorkspace.
+Servidor MCP JuanWorkspace (fusionado).
 
 Da herramientas para:
-  - (admin) registrar/quitar apps del ecosistema, ver cuentas registradas
-  - (cuenta) iniciar sesión, listar apps, conectar/desconectar apps,
-    leer el manifiesto de una app, y leer/crear/editar/borrar los datos
-    de esa app que pertenecen a la cuenta logueada
+  - (bajo nivel) listar/crear/renombrar/borrar proyectos, regenerar su API key,
+    listar/crear/borrar colecciones, y CRUD de documentos en cualquier
+    colección de cualquier proyecto de SmallDB
+  - (admin ecosistema) registrar/quitar apps del ecosistema, ver cuentas
+    registradas
+  - (cuenta) iniciar sesión, listar apps, conectar/desconectar apps, leer el
+    manifiesto de una app, y leer/crear/editar/borrar los datos de esa app
+    que pertenecen a la cuenta logueada
 
-Habla por HTTP con los endpoints /api/ecosystem/* y /api/admin/ecosystem/*
-del backend de SmallDB (el mismo app.py de siempre).
+Habla por HTTP con la API administrativa de SmallDB (endpoints /api/admin/...)
+y con los endpoints /api/ecosystem/* del mismo backend, usando una clave
+maestra (ADMIN_API_KEY) que NUNCA se expone al cliente MCP.
 
 Variables de entorno requeridas:
   SMALLDB_BASE_URL   -> ej: https://juansmalldb.pythonanywhere.com
   SMALLDB_ADMIN_KEY  -> el mismo valor que ADMIN_API_KEY en SmallDB
-                        (solo se usa para las herramientas de administración
-                        de apps; nunca se expone al modelo)
 
 Variable opcional (fuertemente recomendada):
   MCP_SECRET         -> si se define, todas las peticiones a este servidor MCP
@@ -54,12 +57,14 @@ if not SMALLDB_BASE_URL or not SMALLDB_ADMIN_KEY:
 mcp = MCPServer(
     name="juanworkspace",
     instructions=(
-        "Herramientas para administrar el ecosistema JuanWorkspace: registrar "
-        "apps nuevas, iniciar sesión con una cuenta de JuanWorkspace, listar "
-        "las apps conectadas, y leer/crear/editar/borrar los datos de una app "
-        "que pertenecen a la cuenta logueada. Las herramientas de cuenta "
-        "requieren un access_token (obtenido con login); las de administración "
-        "de apps no lo requieren, usan la clave maestra del servidor."
+        "Herramientas para administrar TODO el ecosistema JuanWorkspace: "
+        "tanto la base de datos SmallDB de bajo nivel (proyectos, colecciones, "
+        "documentos) como el ecosistema de cuentas y apps (registrar apps, "
+        "login, conectar apps, y leer/crear/editar/borrar los datos de una "
+        "app que pertenecen a la cuenta logueada). "
+        "Las herramientas de cuenta (login, list_apps, get_app_data, etc.) "
+        "requieren un access_token obtenido con login(); el resto usa la "
+        "clave maestra del servidor, sin necesitar token."
     ),
 )
 
@@ -93,6 +98,187 @@ async def _admin_request(method: str, path: str, json: dict | None = None) -> An
 
 async def _account_request(method: str, path: str, access_token: str, json: dict | None = None) -> Any:
     return await _request(method, path, _account_headers(access_token), json)
+
+
+# ---------------------------------------------------------------------------
+# Herramientas de SmallDB de bajo nivel (proyectos, colecciones, documentos)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def list_projects() -> list[dict]:
+    """Lista todos los proyectos (apps) que existen en SmallDB, con su id, nombre y api_key."""
+    data = await _admin_request("GET", "/api/admin/projects")
+    return data["projects"]
+
+
+@mcp.tool()
+async def create_project(name: str) -> dict:
+    """Crea un nuevo proyecto (app) en SmallDB y devuelve su id y su api_key recién generada.
+
+    Args:
+        name: Nombre del proyecto, por ejemplo 'Cronómetro Pro Max' o 'mi-app-flutter'.
+    """
+    return await _admin_request("POST", "/api/admin/projects", json={"name": name})
+
+
+@mcp.tool()
+async def get_project(project_id: int) -> dict:
+    """Obtiene el detalle de un proyecto (nombre, api_key, fecha) junto con sus colecciones.
+
+    Args:
+        project_id: El id numérico del proyecto (lo devuelve list_projects / create_project).
+    """
+    return await _admin_request("GET", f"/api/admin/projects/{project_id}")
+
+
+@mcp.tool()
+async def rename_project(project_id: int, new_name: str) -> dict:
+    """Cambia el nombre de un proyecto existente.
+
+    Args:
+        project_id: id del proyecto a renombrar.
+        new_name: nuevo nombre para el proyecto.
+    """
+    return await _admin_request("PATCH", f"/api/admin/projects/{project_id}", json={"name": new_name})
+
+
+@mcp.tool()
+async def delete_project(project_id: int) -> dict:
+    """Elimina un proyecto por completo, incluyendo todas sus colecciones y documentos.
+    Esta acción no se puede deshacer, úsala solo si el usuario confirma explícitamente.
+
+    Args:
+        project_id: id del proyecto a eliminar.
+    """
+    return await _admin_request("DELETE", f"/api/admin/projects/{project_id}")
+
+
+@mcp.tool()
+async def regenerate_api_key(project_id: int) -> dict:
+    """Invalida la API key actual de un proyecto y genera una nueva.
+    Cualquier app que use la key anterior dejará de poder conectarse hasta
+    que se actualice con la nueva key devuelta aquí.
+
+    Args:
+        project_id: id del proyecto.
+    """
+    return await _admin_request("POST", f"/api/admin/projects/{project_id}/regenerate_key")
+
+
+@mcp.tool()
+async def list_collections(project_id: int) -> list[dict]:
+    """Lista las colecciones ('tablas') de un proyecto, con cuántos documentos tiene cada una.
+
+    Args:
+        project_id: id del proyecto.
+    """
+    data = await _admin_request("GET", f"/api/admin/projects/{project_id}/collections")
+    return data["collections"]
+
+
+@mcp.tool()
+async def create_collection(project_id: int, name: str) -> dict:
+    """Crea una colección nueva y vacía dentro de un proyecto.
+    (No es obligatorio: las colecciones también se crean solas al guardar el
+    primer documento vía la API pública. Usa esto solo si el usuario quiere
+    dejarla preparada de antemano.)
+
+    Args:
+        project_id: id del proyecto.
+        name: nombre de la colección, por ejemplo 'usuarios' o 'historial'.
+    """
+    return await _admin_request("POST", f"/api/admin/projects/{project_id}/collections", json={"name": name})
+
+
+@mcp.tool()
+async def delete_collection(project_id: int, collection_id: int) -> dict:
+    """Elimina una colección y todos sus documentos. No se puede deshacer.
+
+    Args:
+        project_id: id del proyecto dueño de la colección.
+        collection_id: id de la colección a eliminar.
+    """
+    return await _admin_request("DELETE", f"/api/admin/projects/{project_id}/collections/{collection_id}")
+
+
+@mcp.tool()
+async def list_documents(project_id: int, collection_id: int) -> list[dict]:
+    """Lista todos los documentos de una colección, con su _id, contenido y fechas.
+
+    Args:
+        project_id: id del proyecto.
+        collection_id: id de la colección.
+    """
+    data = await _admin_request(
+        "GET", f"/api/admin/projects/{project_id}/collections/{collection_id}/documents"
+    )
+    return data["documents"]
+
+
+@mcp.tool()
+async def get_document(project_id: int, collection_id: int, doc_id: str) -> dict:
+    """Obtiene un documento individual por su _id.
+
+    Args:
+        project_id: id del proyecto.
+        collection_id: id de la colección.
+        doc_id: el _id del documento (lo devuelve list_documents / create_document).
+    """
+    return await _admin_request(
+        "GET", f"/api/admin/projects/{project_id}/collections/{collection_id}/documents/{doc_id}"
+    )
+
+
+@mcp.tool()
+async def create_document(project_id: int, collection_id: int, data: dict) -> dict:
+    """Crea un documento nuevo dentro de una colección.
+
+    Args:
+        project_id: id del proyecto.
+        collection_id: id de la colección.
+        data: diccionario JSON con los campos del documento. Puedes incluir
+            la clave "_id" para forzar un identificador específico; si no,
+            se genera uno automáticamente.
+    """
+    return await _admin_request(
+        "POST", f"/api/admin/projects/{project_id}/collections/{collection_id}/documents", json=data
+    )
+
+
+@mcp.tool()
+async def update_document(
+    project_id: int, collection_id: int, doc_id: str, data: dict, replace: bool = False
+) -> dict:
+    """Edita un documento existente dentro de una colección.
+
+    Args:
+        project_id: id del proyecto.
+        collection_id: id de la colección.
+        doc_id: el _id del documento a editar.
+        data: campos a actualizar. Por defecto solo se combinan (patch parcial)
+            con los campos existentes del documento.
+        replace: si es True, reemplaza el documento completo con `data` en vez
+            de solo actualizar los campos dados.
+    """
+    method = "PUT" if replace else "PATCH"
+    return await _admin_request(
+        method,
+        f"/api/admin/projects/{project_id}/collections/{collection_id}/documents/{doc_id}",
+        json=data,
+    )
+
+
+@mcp.tool()
+async def delete_document(project_id: int, collection_id: int, doc_id: str) -> dict:
+    """Elimina un documento individual de una colección. No se puede deshacer.
+
+    Args:
+        project_id: id del proyecto.
+        collection_id: id de la colección.
+        doc_id: el _id del documento a eliminar.
+    """
+    return await _admin_request(
+        "DELETE", f"/api/admin/projects/{project_id}/collections/{collection_id}/documents/{doc_id}"
+    )
 
 
 # ---------------------------------------------------------------------------
