@@ -19,9 +19,36 @@ Variables de entorno requeridas:
   SMALLDB_BASE_URL   -> ej: https://juansmalldb.pythonanywhere.com
   SMALLDB_ADMIN_KEY  -> el mismo valor que ADMIN_API_KEY en SmallDB
 
-Variable opcional (fuertemente recomendada):
+Variable opcional:
   MCP_SECRET         -> si se define, todas las peticiones a este servidor MCP
                          deben incluir el header  X-MCP-Secret: <valor>
+                         NOTA: este mecanismo es EXCLUYENTE con el flujo OAuth
+                         descrito abajo. Si vas a usar OAuth (recomendado),
+                         deja MCP_SECRET sin definir: el middleware compara el
+                         Bearer entrante contra MCP_SECRET literal, y con OAuth
+                         ese Bearer es un access_token real emitido por SmallDB,
+                         nunca coincidirá con MCP_SECRET.
+
+--------------------------------------------------------------------------
+OAuth para el conector de Claude
+--------------------------------------------------------------------------
+Este servidor NO implementa su propio Authorization Server: delega en el que
+ya existe en el backend SmallDB (endpoints /oauth/authorize y /oauth/token,
+ver app.py). Para que Claude (o cualquier cliente MCP compatible) descubra
+automáticamente ese Authorization Server, este servidor publica el documento
+de "OAuth Protected Resource Metadata" (RFC 9728) en:
+
+  GET /.well-known/oauth-protected-resource
+
+Pasos para dejarlo funcionando:
+  1. Registra "Claude" como app del ecosistema en SmallDB (una sola vez),
+     con redirect_uri = https://claude.ai/api/mcp/auth_callback.
+     Esto te da un client_id y un client_secret.
+  2. Despliega este server.py y el app.py parcheado (con soporte PKCE +
+     metadata) en SmallDB.
+  3. En Claude: Settings > Connectors > Add connector > Remote.
+       URL: https://juanworkspace-mcp.onrender.com
+       Advanced settings > OAuth Client ID / Secret: los del paso 1.
 
 Ejecutar localmente:
   pip install -r requirements.txt
@@ -517,6 +544,29 @@ class SecretHeaderMiddleware(BaseHTTPMiddleware):
 
 if MCP_SECRET:
     app.add_middleware(SecretHeaderMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# OAuth Protected Resource Metadata (RFC 9728)
+# ---------------------------------------------------------------------------
+# Este documento le dice a un cliente MCP (Claude, etc.) qué Authorization
+# Server usar para obtener un token antes de conectarse a ESTE servidor MCP.
+# El Authorization Server real (authorize + token endpoints, login de
+# usuario, PKCE) vive en el backend SmallDB, no aquí — ver SMALLDB_BASE_URL
+# y el archivo app.py.
+async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "resource": f"https://{PUBLIC_HOST}",
+        "authorization_servers": [SMALLDB_BASE_URL],
+        "bearer_methods_supported": ["header"],
+    })
+
+
+app.add_route(
+    "/.well-known/oauth-protected-resource",
+    oauth_protected_resource_metadata,
+    methods=["GET"],
+)
 
 
 if __name__ == "__main__":
