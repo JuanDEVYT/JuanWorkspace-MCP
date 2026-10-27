@@ -123,20 +123,38 @@ start "MCP Archivos - Servidor" cmd /k python mcp_archivos.py --root "!ROOT!" --
 
 echo  Iniciando tunel de Cloudflare...
 if exist tunnel.log del tunnel.log >nul 2>&1
+
+:: Cloudflare escribe la URL en stderr con formato JSON o texto plano segun version.
+:: Redirigimos stdout+stderr al log y probamos dos patrones.
 start "MCP Archivos - Tunel" /min cmd /c ""!CF!" tunnel --url http://localhost:!PORT! > tunnel.log 2>&1"
 
-echo  Esperando la URL publica ^(hasta 40 s^)...
+echo  Esperando la URL publica (hasta 60 s)...
 set "TURL="
-for /l %%i in (1,1,40) do (
+for /l %%i in (1,1,60) do (
   if not defined TURL (
     timeout /t 1 /nobreak >nul
-    for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command "$m=Select-String -Path 'tunnel.log' -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' -ErrorAction SilentlyContinue; if($m){$m[0].Matches[0].Value}"`) do set "TURL=%%u"
+    :: Patron 1: cloudflared moderno - campo JSON  "url":"https://..."
+    for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command "$t=Get-Content 'tunnel.log' -Raw -ErrorAction SilentlyContinue; if($t){$m=[regex]::Match($t,'\"url\":\"(https://[a-z0-9\-]+\.trycloudflare\.com)\"'); if($m.Success){$m.Groups[1].Value}}"`) do if not defined TURL set "TURL=%%u"
+    :: Patron 2: cloudflared antiguo - URL en texto plano
+    if not defined TURL (
+      for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command "$t=Get-Content 'tunnel.log' -Raw -ErrorAction SilentlyContinue; if($t){$m=[regex]::Match($t,'https://[a-z0-9\-]+\.trycloudflare\.com'); if($m.Success){$m.Value}}"`) do if not defined TURL set "TURL=%%u"
+    )
   )
 )
 
 if not defined TURL (
   echo.
-  echo  No se pudo leer la URL del tunel. Revisa la ventana del tunel o tunnel.log
+  echo  No se pudo leer la URL del tunel tras 60 segundos.
+  echo.
+  echo  --- Contenido de tunnel.log ---
+  type tunnel.log 2>nul
+  echo  --- Fin del log ---
+  echo.
+  echo  Causas comunes:
+  echo    - cloudflared no arranco (falta cloudflared.exe junto al .bat)
+  echo    - el puerto !PORT! ya esta en uso (cambialo en Configuracion)
+  echo    - antivirus o firewall bloqueando cloudflared.exe
+  echo.
   pause
   goto menu
 )
@@ -156,13 +174,13 @@ set "FULL=!TURL!/!SECRET!/mcp"
 
 echo.
 echo ==============================================
-echo   LISTO. URL de tu tunel ^(ya copiada al portapapeles^):
+echo   LISTO. URL de tu tunel (ya copiada al portapapeles):
 echo.
 echo   !FULL!
 echo.
 echo   Pegala en el panel de JuanWorkspace:
 echo   "Tunel de mi PC" ^> Guardar.
-echo   ^(Con eso Claude usa tu PC a traves de JuanWorkspace.^)
+echo   (Con eso Claude usa tu PC a traves de JuanWorkspace.)
 echo.
 echo   Trata esta URL como una contrasena: quien la tenga
 echo   controla tu carpeta compartida.
@@ -172,7 +190,6 @@ echo  Deja abiertas las ventanas del servidor y del tunel.
 echo  Si las cierras o reinicias, la URL cambia: repite este paso.
 pause
 goto menu
-
 :: ---------------------------------------------------------- SHOW URL
 :showurl
 echo.
