@@ -186,6 +186,7 @@ def do_start():
 
     # ── cloudflared ───────────────────────────────────────────────────────────
     log(C, "TUNEL", f"Arrancando cloudflared → puerto {cfg['port']}…")
+    log(C, "TUNEL", f"Ejecutable: {cf}")
     tunnel_url["value"] = None
     url_event = threading.Event()
 
@@ -194,13 +195,37 @@ def do_start():
         return
 
     procs["tunel"] = cf_proc
+
+    # Dar 2 s para que arranque y ver si se cae de inmediato
+    time.sleep(2)
+    rc = cf_proc.poll()
+    if rc is not None:
+        log(R, "ERROR", f"cloudflared terminó al arrancar (código {rc}).")
+        log(Y, "INFO ", "Salida completa:")
+        try:
+            out = cf_proc.stdout.read()
+            for line in out.splitlines():
+                print(f"  {C}{DIM}[TUN]{RST} {line}")
+        except Exception:
+            pass
+        log(Y, "INFO ", "Posibles causas:")
+        log(Y, "INFO ", "  · cloudflared.exe corrupto o de arquitectura incorrecta (ARM vs x64)")
+        log(Y, "INFO ", "  · antivirus bloqueándolo — añádelo a excepciones")
+        log(Y, "INFO ", "  · puerto 8765 ya ocupado — cámbialo en Configurar")
+        log(Y, "INFO ", f"  · prueba manualmente: cd a {HERE} y ejecuta: cloudflared tunnel --url http://localhost:{cfg['port']}")
+        return
+
     threading.Thread(target=stream_output, args=(cf_proc, "TUN", C, url_event), daemon=True).start()
 
     log(C, "TUNEL", "Esperando URL pública (hasta 60 s)…")
     got = url_event.wait(timeout=60)
 
     if not got or not tunnel_url["value"]:
-        log(R, "ERROR", "No se capturó la URL en 60 s. Revisa los mensajes [TUN] de arriba.")
+        log(R, "ERROR", "No se capturó la URL en 60 s.")
+        log(Y, "INFO ", "Si no ves mensajes [TUN], cloudflared no está escribiendo a stdout.")
+        log(Y, "INFO ", f"Prueba manual: abre cmd, ve a {HERE}")
+        log(Y, "INFO ", f"  y ejecuta: cloudflared tunnel --url http://localhost:{cfg['port']}")
+        log(Y, "INFO ", "Si ves la URL ahí, cópiala y úsala en la opción 3.")
         return
 
     full_url = f"{tunnel_url['value']}/{secret}/mcp"
