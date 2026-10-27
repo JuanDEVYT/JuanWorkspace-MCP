@@ -127,51 +127,22 @@ def make_popen_kwargs(extra_flags=0):
 
 def launch_cloudflared(cf, port):
     """
-    Intenta lanzar cloudflared de tres formas:
-      1. Directo (lo normal)
-      2. Con ShellExecute runas (si da WinError 740 = necesita admin)
-      3. Con shell=True como último recurso
-    Devuelve el proceso o None si falla todo.
+    Lanza cloudflared con shell=True para evitar WinError 740 en Windows.
+    shell=True hace que cmd.exe lo lance y hereda permisos correctamente.
     """
-    cmd = [cf, "tunnel", "--url", f"http://localhost:{port}"]
-    kw = make_popen_kwargs()
-
-    # Intento 1: directo
+    cmd = f'"{cf}" tunnel --url http://localhost:{port}'
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+    kw = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              text=True, encoding="utf-8", errors="replace",
+              env=env, shell=True)
+    if os.name == "nt":
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         return subprocess.Popen(cmd, **kw)
-    except OSError as e:
-        if getattr(e, "winerror", None) != 740:
-            raise
-        log(Y, "INFO ", f"cloudflared requiere elevación (WinError 740).")
-
-    # Intento 2: runas vía ShellExecute — pero entonces no podemos capturar stdout.
-    # En cambio relanzamos ESTE panel como admin para que cloudflared herede permisos.
-    log(Y, "INFO ", "Relanzando el panel como administrador para que cloudflared funcione…")
-    log(Y, "INFO ", "(Windows pedirá confirmación UAC)")
-    time.sleep(1)
-    try:
-        import ctypes
-        # Reejecutar panel.py con runas; la ventana actual se cierra
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas",
-            sys.executable,
-            f'"{Path(__file__)}"',
-            str(HERE),
-            1  # SW_SHOWNORMAL
-        )
-        # Si ShellExecute tiene éxito, salimos de esta instancia
-        sys.exit(0)
-    except Exception as e2:
-        log(R, "ERROR", f"No se pudo relanzar como admin: {e2}")
-
-    # Intento 3: shell=True (último recurso, captura limitada)
-    log(Y, "INFO ", "Intentando con shell=True como último recurso…")
-    try:
-        kw2 = make_popen_kwargs()
-        kw2["shell"] = True
-        return subprocess.Popen(" ".join(f'"{x}"' for x in cmd), **kw2)
-    except Exception as e3:
-        log(R, "ERROR", f"Todos los intentos fallaron: {e3}")
+    except Exception as e:
+        log(R, "ERROR", f"No se pudo iniciar cloudflared: {e}")
+        log(Y, "INFO ", f"Ruta usada: {cf}")
+        log(Y, "INFO ", "Asegúrate de que cloudflared.exe esté junto al panel.py")
         return None
 
 def do_start():
