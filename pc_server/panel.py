@@ -2,7 +2,7 @@
 """
 panel.py — Interfaz de terminal para MCP Archivos
 """
-import os, sys, json, re, subprocess, threading, time, secrets, shutil, signal, ctypes
+import os, sys, re, subprocess, threading, time, secrets, shutil, signal, ctypes
 from pathlib import Path
 from datetime import datetime
 
@@ -18,6 +18,7 @@ HERE        = Path(__file__).parent
 CFG_FILE    = HERE / "mcp_config.py"
 SECRET_FILE = HERE / ".mcp_secret"
 URL_FILE    = HERE / "url_conector.txt"
+CF_LOG_FILE = HERE / "cloudflared.log"
 
 cfg = {"root": None, "port": 8765, "allow_delete": False, "allow_exec": False}
 
@@ -74,10 +75,12 @@ def pause(msg="  Pulsa Enter para volver al menú…"):
 procs: dict = {}
 tunnel_url = {"value": None}
 
-def stream_output(proc, label, color, url_event=None):
-    url_re_json  = re.compile(r'"url":"(https://[a-z0-9\-]+\.trycloudflare\.com)"')
-    url_re_plain = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
+# Regex para capturar la URL de cloudflared (JSON o texto plano)
+URL_RE_JSON  = re.compile(r'"url"\s*:\s*"(https://[a-z0-9\-]+\.trycloudflare\.com)"')
+URL_RE_PLAIN = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
 
+def stream_output(proc, label, color):
+    """Lee stdout+stderr mezclados de un proceso (para el servidor MCP)."""
     def read_pipe(pipe):
         try:
             for raw in pipe:
@@ -85,19 +88,48 @@ def stream_output(proc, label, color, url_event=None):
                 if not line: continue
                 print(f"  {color}{DIM}[{label}]{RST} {line}")
                 sys.stdout.flush()
-                if url_event and not tunnel_url["value"]:
-                    m = url_re_json.search(line) or url_re_plain.search(line)
-                    if m:
-                        tunnel_url["value"] = m.group(1) if url_re_json.search(line) else m.group(0)
-                        url_event.set()
         except Exception:
             pass
 
-    # Read stdout in this thread, stderr in a sibling thread (cloudflared writes to stderr)
     if proc.stderr:
         threading.Thread(target=read_pipe, args=(proc.stderr,), daemon=True).start()
     if proc.stdout:
-        read_pipe(proc.stdout)
+        threading.Thread(target=read_pipe, args=(proc.stdout,), daemon=True).start()
+
+def watch_cloudflared_log(url_event, timeout=60):
+    """
+    Monitorea CF_LOG_FILE hasta encontrar la URL pública del túnel.
+    cloudflared en Windows usa WriteConsole() y no escribe al pipe estándar,
+    por eso usamos --logfile para capturar su salida en disco.
+    Se llama en un hilo daemon.
+    """
+    deadline = time.time() + timeout
+    last_pos = 0
+    while time.time() < deadline:
+        if CF_LOG_FILE.exists():
+            try:
+                with CF_LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
+                    f.seek(last_pos)
+                    for line in f:
+                        last_pos = f.tell()
+                        line = line.rstrip()
+                        if line:
+                            print(f"  {C}{DIM}[TUN]{RST} {line}")
+                            sys.stdout.flush()
+                        if not tunnel_url["value"]:
+                            m = URL_RE_JSON.search(line)
+                            if m:
+                                tunnel_url["value"] = m.group(1)
+                                url_event.set()
+                                return
+                            m = URL_RE_PLAIN.search(line)
+                            if m:
+                                tunnel_url["value"] = m.group(0)
+                                url_event.set()
+                                return
+            except Exception:
+                pass
+        time.sleep(0.5)
 
 def kill_all():
     for name, p in list(procs.items()):
@@ -115,76 +147,52 @@ def kill_all():
     procs.clear()
     tunnel_url["value"] = None
 
-def make_popen_kwargs(extra_flags=0):
-    """kwargs comunes para Popen — sin elevar, sin ventana nueva."""
+def make_popen_kwargs():
+    """kwargs para el servidor MCP (captura stdout+stderr)."""
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     kw = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
               text=True, encoding="utf-8", errors="replace", env=env)
     if os.name == "nt":
-        # CREATE_NEW_PROCESS_GROUP para poder matarlo con taskkill /T
-        # NO usamos CREATE_NO_WINDOW aquí porque queremos capturar stdout
-        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | extra_flags
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
     return kw
 
-def find_metrics_port(base=20241):
-    """cloudflared expone /quicktunnel en su metrics server (default 20241, +1 si ocupado)."""
-    import urllib.request
-    for port in range(base, base + 10):
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/quicktunnel", timeout=1) as resp:
-                data = json.loads(resp.read())
-                return data.get("url") or data.get("hostname")
-        except Exception:
-            pass
-    return None
-
-def poll_tunnel_url(url_event, timeout=60):
-    """Pregunta a la metrics API de cloudflared hasta obtener la URL."""
-    import urllib.request
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            for port in range(20241, 20251):
-                try:
-                    with urllib.request.urlopen(
-                            f"http://127.0.0.1:{port}/quicktunnel", timeout=2) as resp:
-                        data = json.loads(resp.read())
-                        url = data.get("url") or data.get("hostname")
-                        if url:
-                            if not url.startswith("http"):
-                                url = "https://" + url
-                            tunnel_url["value"] = url
-                            url_event.set()
-                            return
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        time.sleep(1)
-
 def launch_cloudflared(cf, port):
     """
-    Lanza cloudflared. No capturamos su output (escribe al handle de consola en Windows,
-    no al pipe). En cambio leemos la URL desde su metrics API en /quicktunnel.
+    Lanza cloudflared con --logfile para capturar su salida en disco.
+    cloudflared en Windows usa WriteConsole() y NO escribe al pipe estándar,
+    por lo que cualquier intento de capturar stdout/stderr con PIPE falla.
+    La solución es forzar el log a un archivo y leerlo desde watch_cloudflared_log().
     """
-    cmd = [cf, "tunnel", "--url", f"http://localhost:{port}"]
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
-    # DETACHED: cloudflared corre solo, sin pipe, para que use su console handle normal
-    kw = dict(env=env)
+    # Borra log anterior para no confundir URLs viejas
+    if CF_LOG_FILE.exists():
+        try: CF_LOG_FILE.unlink()
+        except Exception: pass
+
+    cmd = [cf, "tunnel",
+           "--loglevel", "info",
+           "--logfile", str(CF_LOG_FILE),
+           "--url", f"http://localhost:{port}"]
+    env = {**os.environ}
+    kw = dict(
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
     if os.name == "nt":
-        kw["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP |
-                               subprocess.CREATE_NO_WINDOW)
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
     try:
         return subprocess.Popen(cmd, **kw)
     except OSError as e:
         if getattr(e, "winerror", None) == 740:
             log(R, "ERROR", "cloudflared requiere elevación (WinError 740).")
-            log(Y, "INFO ", "Clic derecho en iniciar_mcp.bat → Ejecutar como administrador.")
+            log(Y, "INFO ", "Ejecuta iniciar_mcp.bat como Administrador (clic derecho → Ejecutar como admin).")
         else:
             log(R, "ERROR", f"No se pudo iniciar cloudflared: {e}")
-            log(Y, "INFO ", f"Ruta: {cf}")
+            log(Y, "INFO ", f"Ruta usada: {cf}")
         return None
 
 def do_start():
@@ -229,6 +237,7 @@ def do_start():
     # ── cloudflared ───────────────────────────────────────────────────────────
     log(C, "TUNEL", f"Arrancando cloudflared → puerto {cfg['port']}…")
     log(C, "TUNEL", f"Ejecutable: {cf}")
+    log(C, "TUNEL", f"Log: {CF_LOG_FILE}")
     tunnel_url["value"] = None
     url_event = threading.Event()
 
@@ -237,17 +246,24 @@ def do_start():
         return
 
     procs["tunel"] = cf_proc
-    log(C, "TUNEL", "cloudflared corriendo. Esperando URL vía metrics API (hasta 60 s)…")
-    url_event = threading.Event()
-    threading.Thread(target=poll_tunnel_url, args=(url_event,), daemon=True).start()
+
+    # Monitorear el log en un hilo daemon
+    threading.Thread(target=watch_cloudflared_log, args=(url_event, 60), daemon=True).start()
+
+    log(C, "TUNEL", "Esperando URL pública (hasta 60 s)…")
     got = url_event.wait(timeout=60)
 
     if not got or not tunnel_url["value"]:
-        log(R, "ERROR", "No se obtuvo la URL en 60 s.")
-        log(Y, "INFO ", "cloudflared está corriendo pero no expuso /quicktunnel.")
-        log(Y, "INFO ", "Abre cmd y ejecuta manualmente para ver qué pasa:")
-        log(Y, "INFO ", f'  cloudflared tunnel --url http://localhost:{cfg["port"]}')
-        log(Y, "INFO ", "Copia la URL que aparece y úsala en la opción 3.")
+        log(R, "ERROR", "No se capturó la URL en 60 s.")
+        if CF_LOG_FILE.exists():
+            log(Y, "INFO ", f"Revisa el log en: {CF_LOG_FILE}")
+            try:
+                content = CF_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+                print(content[:2000])
+            except Exception:
+                pass
+        else:
+            log(Y, "INFO ", "cloudflared no creó el archivo de log. Puede requerir elevación.")
         return
 
     full_url = f"{tunnel_url['value']}/{secret}/mcp"
