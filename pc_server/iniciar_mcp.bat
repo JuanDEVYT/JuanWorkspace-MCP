@@ -124,36 +124,49 @@ start "MCP Archivos - Servidor" cmd /k python mcp_archivos.py --root "!ROOT!" --
 echo  Iniciando tunel de Cloudflare...
 if exist tunnel.log del tunnel.log >nul 2>&1
 
-:: Cloudflare escribe la URL en stderr con formato JSON o texto plano segun version.
-:: Redirigimos stdout+stderr al log y probamos dos patrones.
-start "MCP Archivos - Tunel" /min cmd /c ""!CF!" tunnel --url http://localhost:!PORT! > tunnel.log 2>&1"
+:: Usamos PowerShell para lanzar cloudflared y capturar stdout+stderr correctamente.
+:: cmd /c con comillas anidadas no redirige bien en todas las versiones de Windows.
+powershell -NoProfile -WindowStyle Hidden -Command ^
+  "Start-Process -FilePath '!CF!' -ArgumentList 'tunnel','--url','http://localhost:!PORT!' -RedirectStandardOutput 'tunnel.log' -RedirectStandardError 'tunnel_err.log' -NoNewWindow"
 
+:: Esperar a que arranque y escriba la URL (hasta 60 s, revisando ambos logs)
 echo  Esperando la URL publica (hasta 60 s)...
 set "TURL="
 for /l %%i in (1,1,60) do (
   if not defined TURL (
     timeout /t 1 /nobreak >nul
-    :: Patron 1: cloudflared moderno - campo JSON  "url":"https://..."
-    for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command "$t=Get-Content 'tunnel.log' -Raw -ErrorAction SilentlyContinue; if($t){$m=[regex]::Match($t,'\"url\":\"(https://[a-z0-9\-]+\.trycloudflare\.com)\"'); if($m.Success){$m.Groups[1].Value}}"`) do if not defined TURL set "TURL=%%u"
-    :: Patron 2: cloudflared antiguo - URL en texto plano
-    if not defined TURL (
-      for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command "$t=Get-Content 'tunnel.log' -Raw -ErrorAction SilentlyContinue; if($t){$m=[regex]::Match($t,'https://[a-z0-9\-]+\.trycloudflare\.com'); if($m.Success){$m.Value}}"`) do if not defined TURL set "TURL=%%u"
+    for %%L in (tunnel.log tunnel_err.log) do (
+      if not defined TURL (
+        :: Patron JSON moderno: "url":"https://...trycloudflare.com"
+        for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command ^
+          "try{$t=Get-Content '%%L' -Raw -EA Stop}catch{exit}; $m=[regex]::Match($t,'\"url\":\"(https://[a-z0-9\-]+\.trycloudflare\.com)\"'); if($m.Success){$m.Groups[1].Value}"`) do ^
+          if not defined TURL set "TURL=%%u"
+        :: Patron texto plano antiguo: https://...trycloudflare.com
+        if not defined TURL (
+          for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command ^
+            "try{$t=Get-Content '%%L' -Raw -EA Stop}catch{exit}; $m=[regex]::Match($t,'https://[a-z0-9\-]+\.trycloudflare\.com'); if($m.Success){$m.Value}"`) do ^
+            if not defined TURL set "TURL=%%u"
+        )
+      )
     )
   )
 )
 
 if not defined TURL (
   echo.
-  echo  No se pudo leer la URL del tunel tras 60 segundos.
+  echo  No se pudo capturar la URL tras 60 segundos.
   echo.
-  echo  --- Contenido de tunnel.log ---
+  echo  --- tunnel.log ---
   type tunnel.log 2>nul
-  echo  --- Fin del log ---
+  echo.
+  echo  --- tunnel_err.log ---
+  type tunnel_err.log 2>nul
   echo.
   echo  Causas comunes:
-  echo    - cloudflared no arranco (falta cloudflared.exe junto al .bat)
-  echo    - el puerto !PORT! ya esta en uso (cambialo en Configuracion)
-  echo    - antivirus o firewall bloqueando cloudflared.exe
+  echo    - cloudflared.exe no esta junto al .bat
+  echo    - el puerto !PORT! ya esta en uso (cambiar en opcion 2)
+  echo    - antivirus bloqueando cloudflared.exe
+  echo    - Windows Defender requiere permitir cloudflared la primera vez
   echo.
   pause
   goto menu
