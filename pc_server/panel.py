@@ -76,27 +76,28 @@ tunnel_url = {"value": None}
 
 def stream_output(proc, label, color, url_event=None):
     url_re_json  = re.compile(r'"url":"(https://[a-z0-9\-]+\.trycloudflare\.com)"')
-    # cloudflared prints the URL inside an ASCII box:  |  https://xxx.trycloudflare.com   |
-    # so we match the URL anywhere in the line, ignoring surrounding spaces/pipes
     url_re_plain = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
-    try:
-        for raw in proc.stdout:
-            line = raw.rstrip()
-            if not line: continue
-            print(f"  {color}{DIM}[{label}]{RST} {line}")
-            sys.stdout.flush()
-            if url_event and not tunnel_url["value"]:
-                m = url_re_json.search(line)
-                if m:
-                    tunnel_url["value"] = m.group(1)
-                    url_event.set()
-                else:
-                    m = url_re_plain.search(line)
+
+    def read_pipe(pipe):
+        try:
+            for raw in pipe:
+                line = raw.rstrip()
+                if not line: continue
+                print(f"  {color}{DIM}[{label}]{RST} {line}")
+                sys.stdout.flush()
+                if url_event and not tunnel_url["value"]:
+                    m = url_re_json.search(line) or url_re_plain.search(line)
                     if m:
-                        tunnel_url["value"] = m.group(0)
+                        tunnel_url["value"] = m.group(1) if url_re_json.search(line) else m.group(0)
                         url_event.set()
-    except Exception:
-        pass
+        except Exception:
+            pass
+
+    # Read stdout in this thread, stderr in a sibling thread (cloudflared writes to stderr)
+    if proc.stderr:
+        threading.Thread(target=read_pipe, args=(proc.stderr,), daemon=True).start()
+    if proc.stdout:
+        read_pipe(proc.stdout)
 
 def kill_all():
     for name, p in list(procs.items()):
@@ -129,22 +130,24 @@ def make_popen_kwargs(extra_flags=0):
 
 def launch_cloudflared(cf, port):
     """
-    Lanza cloudflared con shell=True para evitar WinError 740 en Windows.
-    shell=True hace que cmd.exe lo lance y hereda permisos correctamente.
+    Lanza cloudflared sin shell=True para capturar stdout y stderr por separado.
+    cloudflared escribe la URL en stderr, por eso necesitamos stderr=PIPE propio.
     """
-    cmd = f'"{cf}" tunnel --url http://localhost:{port}'
+    cmd = [cf, "tunnel", "--url", f"http://localhost:{port}"]
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
-    kw = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-              text=True, encoding="utf-8", errors="replace",
-              env=env, shell=True)
+    kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+              text=True, encoding="utf-8", errors="replace", env=env)
     if os.name == "nt":
         kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         return subprocess.Popen(cmd, **kw)
-    except Exception as e:
-        log(R, "ERROR", f"No se pudo iniciar cloudflared: {e}")
-        log(Y, "INFO ", f"Ruta usada: {cf}")
-        log(Y, "INFO ", "Asegúrate de que cloudflared.exe esté junto al panel.py")
+    except OSError as e:
+        if getattr(e, "winerror", None) == 740:
+            log(R, "ERROR", "cloudflared requiere elevación (WinError 740).")
+            log(Y, "INFO ", "Ejecuta iniciar_mcp.bat como Administrador (clic derecho → Ejecutar como admin).")
+        else:
+            log(R, "ERROR", f"No se pudo iniciar cloudflared: {e}")
+            log(Y, "INFO ", f"Ruta usada: {cf}")
         return None
 
 def do_start():
