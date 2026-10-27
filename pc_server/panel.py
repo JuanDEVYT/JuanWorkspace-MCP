@@ -76,6 +76,8 @@ tunnel_url = {"value": None}
 
 def stream_output(proc, label, color, url_event=None):
     url_re_json  = re.compile(r'"url":"(https://[a-z0-9\-]+\.trycloudflare\.com)"')
+    # cloudflared prints the URL inside an ASCII box:  |  https://xxx.trycloudflare.com   |
+    # so we match the URL anywhere in the line, ignoring surrounding spaces/pipes
     url_re_plain = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
     try:
         for raw in proc.stdout:
@@ -195,26 +197,6 @@ def do_start():
         return
 
     procs["tunel"] = cf_proc
-
-    # Dar 2 s para que arranque y ver si se cae de inmediato
-    time.sleep(2)
-    rc = cf_proc.poll()
-    if rc is not None:
-        log(R, "ERROR", f"cloudflared terminó al arrancar (código {rc}).")
-        log(Y, "INFO ", "Salida completa:")
-        try:
-            out = cf_proc.stdout.read()
-            for line in out.splitlines():
-                print(f"  {C}{DIM}[TUN]{RST} {line}")
-        except Exception:
-            pass
-        log(Y, "INFO ", "Posibles causas:")
-        log(Y, "INFO ", "  · cloudflared.exe corrupto o de arquitectura incorrecta (ARM vs x64)")
-        log(Y, "INFO ", "  · antivirus bloqueándolo — añádelo a excepciones")
-        log(Y, "INFO ", "  · puerto 8765 ya ocupado — cámbialo en Configurar")
-        log(Y, "INFO ", f"  · prueba manualmente: cd a {HERE} y ejecuta: cloudflared tunnel --url http://localhost:{cfg['port']}")
-        return
-
     threading.Thread(target=stream_output, args=(cf_proc, "TUN", C, url_event), daemon=True).start()
 
     log(C, "TUNEL", "Esperando URL pública (hasta 60 s)…")
