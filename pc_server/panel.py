@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 import ctypes
+import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 
@@ -29,6 +31,10 @@ CFG_FILE    = HERE / "mcp_config.py"
 SECRET_FILE = HERE / ".mcp_secret"
 URL_FILE    = HERE / "url_conector.txt"
 CF_LOG_FILE = HERE / "cloudflared.log"
+JW_SESSION  = HERE / "jw_session.json"   # guarda token de JuanWorkspace
+
+JW_BASE       = "https://juansmalldb.pythonanywhere.com"
+JW_TUNNEL_SLUG = "pc-tunnel"
 
 cfg = {"root": None, "port": 8765, "allow_delete": False, "allow_exec": False}
 
@@ -115,6 +121,7 @@ def _read_log_bytes() -> str:
                 ["cmd", "/c", "type", str(CF_LOG_FILE)],
                 capture_output=True, timeout=5
             )
+            # cmd usa la página de códigos del sistema (cp850/cp1252)
             for enc in ("utf-8", "cp1252", "cp850", "latin-1"):
                 try:
                     return result.stdout.decode(enc)
@@ -134,7 +141,7 @@ def watch_cloudflared_log(url_event: threading.Event, timeout: int = 60):
     """
     Monitorea CF_LOG_FILE hasta encontrar la URL pública del túnel.
     cloudflared en Windows usa WriteConsole() y no escribe al pipe estándar,
-    por eso usamos --logfile. Leemos con 'cmd /c type' para evitar el file-lock de Windows.
+    por eso usamos --logfile. Leemos con 'type' para evitar el file-lock de Windows.
     """
     deadline = time.time() + timeout
     seen_bytes = 0
@@ -149,6 +156,7 @@ def watch_cloudflared_log(url_event: threading.Event, timeout: int = 60):
                     line = line.strip()
                     if not line:
                         continue
+                    # Intenta parsear como JSON para mostrar solo el mensaje
                     try:
                         obj = json.loads(line)
                         msg = obj.get("message", line)
@@ -156,6 +164,7 @@ def watch_cloudflared_log(url_event: threading.Event, timeout: int = 60):
                         msg = line
                     print(f"  {C}{DIM}[TUN]{RST} {msg}")
                     sys.stdout.flush()
+                    # Busca la URL en la línea cruda (puede estar en el mensaje con pipes | url |)
                     m = URL_RE.search(line)
                     if m:
                         tunnel_url["value"] = m.group(0)
@@ -248,6 +257,147 @@ def launch_cloudflared(cf, port):
         return None
 
 
+# ── JuanWorkspace: push automático de la URL del túnel ───────────────────────
+
+def _jw_request(path, method="GET", body=None, token=None):
+    """Llamada HTTP mínima sin dependencias externas."""
+    url = JW_BASE + path
+    data = json.dumps(body).encode() if body else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", str(e))
+        except Exception:
+            msg = str(e)
+        raise RuntimeError(msg)
+
+
+def _jw_load_session():
+    """Devuelve el token guardado o None."""
+    if JW_SESSION.exists():
+        try:
+            return json.loads(JW_SESSION.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None
+
+
+def _jw_save_session(data):
+    JW_SESSION.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _jw_login_interactive():
+    """Pide credenciales al usuario, hace login y guarda el token."""
+    sep("LOGIN JUANWORKSPACE")
+    print(f"\n  {DIM}Solo se pregunta una vez. El token se guarda en {JW_SESSION.name}.{RST}\n")
+    username = input(f"  {W}Usuario JuanWorkspace: {RST}").strip()
+    import getpass
+    password = getpass.getpass(f"  {W}Contraseña: {RST}")
+    try:
+        data = _jw_request("/api/ecosystem/login", "POST",
+                            {"username": username, "password": password})
+        _jw_save_session(data)
+        log(G, "JW   ", f"Sesión guardada como {data.get('username', username)}")
+        return data
+    except RuntimeError as e:
+        log(R, "ERROR", f"Login fallido: {e}")
+        return None
+
+
+def _jw_valid_token(session):
+    """Comprueba que el token sigue activo."""
+    if not session or not session.get("access_token"):
+        return False
+    try:
+        _jw_request("/api/ecosystem/me", token=session["access_token"])
+        return True
+    except RuntimeError:
+        return False
+
+
+def _jw_get_session():
+    """Devuelve una sesión válida (cargada o pidiendo login)."""
+    sess = _jw_load_session()
+    if _jw_valid_token(sess):
+        return sess
+    # Token expirado o inexistente → login interactivo
+    log(Y, "JW   ", "Token expirado o no encontrado. Inicia sesión en JuanWorkspace.")
+    return _jw_login_interactive()
+
+
+def _jw_ensure_connected(token):
+    """Conecta la app pc-tunnel si no estaba conectada."""
+    try:
+        _jw_request(f"/api/ecosystem/apps/{JW_TUNNEL_SLUG}/connect",
+                    "POST", {}, token=token)
+    except RuntimeError:
+        pass  # ya estaba conectada, ignorar
+
+
+def _jw_get_tunnel_doc(token):
+    """Devuelve el documento del túnel o None."""
+    try:
+        res = _jw_request(f"/api/ecosystem/apps/{JW_TUNNEL_SLUG}/data",
+                          token=token)
+        docs = res.get("data", [])
+        return next((d for d in docs if d.get("kind") == "tunnel"), None)
+    except RuntimeError:
+        return None
+
+
+def push_tunnel_url(full_url):
+    """
+    Sube automáticamente la URL del túnel a JuanWorkspace.
+    Se llama justo después de que cloudflared emite la URL.
+    """
+    sep("JUANWORKSPACE")
+    log(C, "JW   ", "Subiendo URL del túnel a JuanWorkspace…")
+
+    sess = _jw_get_session()
+    if not sess:
+        log(R, "JW   ", "No se pudo autenticar. Sube la URL manualmente desde la web.")
+        return
+
+    token = sess["access_token"]
+    _jw_ensure_connected(token)
+
+    payload = {
+        "kind":       "tunnel",
+        "tunnel_url": full_url,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    doc = _jw_get_tunnel_doc(token)
+    try:
+        if doc and doc.get("_id"):
+            _jw_request(f"/api/ecosystem/apps/{JW_TUNNEL_SLUG}/data/{doc['_id']}",
+                        "PATCH", payload, token=token)
+            log(G, "JW   ", "URL actualizada en JuanWorkspace ✓")
+        else:
+            _jw_request(f"/api/ecosystem/apps/{JW_TUNNEL_SLUG}/data",
+                        "POST", payload, token=token)
+            log(G, "JW   ", "URL guardada en JuanWorkspace ✓")
+        log(G, "JW   ", "Claude ya puede conectarse a tu PC automáticamente.")
+    except RuntimeError as e:
+        log(R, "JW   ", f"No se pudo subir la URL: {e}")
+        log(Y, "JW   ", "Súbela manualmente desde juanworkspace.wasmer.app")
+
+
+def do_logout_jw():
+    """Elimina la sesión guardada de JuanWorkspace."""
+    if JW_SESSION.exists():
+        JW_SESSION.unlink()
+        log(G, "OK  ", "Sesión de JuanWorkspace eliminada.")
+    else:
+        log(Y, "INFO ", "No había sesión guardada.")
+
+
 def do_start():
     if not cfg["root"] or not Path(cfg["root"]).is_dir():
         log(R, "ERROR", "No hay carpeta configurada. Ve a Configurar primero (opción 2).")
@@ -328,11 +478,17 @@ def do_start():
     except Exception:
         pass
 
+    # ── Push automático a JuanWorkspace ──────────────────────────────────────
+    try:
+        push_tunnel_url(full_url)
+    except Exception as e:
+        log(Y, "JW   ", f"Push automático falló ({e}). Puedes subirla manualmente.")
+
     sep("LISTO")
     print(f"\n  {W}{BLD}URL del conector:{RST}\n")
     print(f"  {LG}{BLD}{full_url}{RST}\n")
-    print(f"  {DIM}Pégala en JuanWorkspace › Túnel de mi PC › Guardar{RST}")
-    print(f"  {DIM}Trátala como contraseña.{RST}\n")
+    print(f"  {DIM}URL subida automáticamente a JuanWorkspace.{RST}")
+    print(f"  {DIM}Si algo falló, pégala manualmente en juanworkspace.wasmer.app{RST}\n")
     sep()
     print(f"\n  {Y}Deja esta ventana abierta.{RST} Pulsa {W}Ctrl+C{RST} para detener todo.\n")
 
@@ -433,18 +589,25 @@ def menu():
         tun_ok    = "tunel"    in procs and procs["tunel"].poll()    is None
         srv_s     = f"{LG}activo{RST}"   if srv_ok else f"{DIM}detenido{RST}"
         tun_s     = f"{LG}activo{RST}"   if tun_ok else f"{DIM}detenido{RST}"
+        # Estado sesión JuanWorkspace
+        jw_sess = _jw_load_session()
+        jw_who  = jw_sess.get("username", "?") if jw_sess else None
+        jw_s    = f"{LG}{jw_who}{RST}" if jw_who else f"{DIM}no autenticado{RST}"
+
         print(f"""
   Carpeta   : {W}{root_show}{RST}
   Puerto    : {cfg['port']}
   Borrar    : {del_show}      Comandos : {exec_show}
   Servidor  : {srv_s}      Túnel    : {tun_s}
+  JuanWS    : {jw_s}
 
-  {G}[1]{RST} Iniciar servidor + túnel
+  {G}[1]{RST} Iniciar servidor + túnel  {DIM}(sube URL a JuanWorkspace automáticamente){RST}
   {G}[2]{RST} Configurar carpeta / opciones
   {G}[3]{RST} Ver URL del túnel
   {G}[4]{RST} Detener todo
   {G}[5]{RST} Regenerar secreto  (invalida URL actual)
-  {G}[6]{RST} Salir
+  {G}[6]{RST} Cerrar sesión de JuanWorkspace
+  {G}[7]{RST} Salir
 """)
         try:
             opt = input(f"  {W}Elige: {RST}").strip()
@@ -469,6 +632,9 @@ def menu():
             do_resecret()
             pause()
         elif opt == "6":
+            do_logout_jw()
+            pause()
+        elif opt == "7":
             kill_all()
             sys.exit(0)
         else:
